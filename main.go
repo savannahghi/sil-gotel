@@ -7,18 +7,22 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-func Validate(object interface{}) error {
+func Validate(object any) error {
 	v := validator.New()
-	err := v.Struct(object)
 
-	return err
+	err := v.Struct(object)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 type Client struct {
 	OTLPBaseURL string `json:"otlpBaseURL" validate:"required"`
 	ServiceName string `json:"serviceName" validate:"required"`
 	Environment string `json:"environment" validate:"required"`
-	Version     string `json:"version" validate:"required"`
+	Version     string `json:"version" validate:"required"` //nolint: tagalign
 }
 
 func NewOtelSDK(ctx context.Context, client *Client) (*Client, error) {

@@ -2,20 +2,37 @@ version: "2"
 run:
   tests: false
 linters:
+  default: all
   disable:
-    - canonicalheader
     - depguard
-    - dupl
-    - err113
-    - exhaustruct
-    - mnd
+    - perfsprint
     - tagliatelle
-    - unparam
-    - unused
-    - embeddedstructfieldcheck
-    - noinlineerr
     - varnamelen
+    - perfsprint
+    - mnd
+    - exhaustruct
     - wrapcheck
+    - wsl
+  enable:
+    - wsl_v5
+  settings:
+    funlen:
+      lines: -1
+      statements: -1
+    revive:
+      rules:
+        - name: unused-parameter
+          arguments:
+            - allowRegex: ^_
+          severity: warning
+          disabled: true
+    staticcheck:
+      checks:
+        - all
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
   exclusions:
     generated: lax
     presets:
@@ -28,6 +45,11 @@ linters:
       - builtin$
       - examples$
 formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
   exclusions:
     generated: lax
     paths:

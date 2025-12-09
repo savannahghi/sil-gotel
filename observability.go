@@ -69,6 +69,7 @@ func (c *Client) setupOtelSDK(ctx context.Context) (func(context.Context) error,
 	meterProvider, err := c.newMeterProvider(ctx)
 	if err != nil {
 		handleErr(err)
+
 		return shutdown, err
 	}
 
@@ -79,6 +80,7 @@ func (c *Client) setupOtelSDK(ctx context.Context) (func(context.Context) error,
 	loggerProvider, err := c.newLoggerProvider(ctx)
 	if err != nil {
 		handleErr(err)
+
 		return shutdown, err
 	}
 
@@ -150,7 +152,7 @@ func (c *Client) newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider
 		otlpmetrichttp.WithHeaders(headers),
 	)
 	if err != nil {
-		return nil, errors.New("failed to create metrics exporter")
+		return nil, err
 	}
 
 	res, err := resource.New(
@@ -162,7 +164,7 @@ func (c *Client) newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider
 		),
 	)
 	if err != nil {
-		return nil, errors.New("failed to build resource")
+		return nil, err
 	}
 
 	meterProvider := sdkmetric.NewMeterProvider(
@@ -232,7 +234,7 @@ func (c *Client) newLoggerProvider(ctx context.Context) (*log.LoggerProvider, er
 	return provider, nil
 }
 
-func Trace(ctx context.Context, packageName, spanName string) (context.Context, otelTrace.Span) {
+func Trace(ctx context.Context, packageName, spanName string) (context.Context, otelTrace.Span) { //nolint: ireturn
 	tracer := otel.Tracer(packageName)
 
 	ctx, span := tracer.Start(ctx, spanName)
@@ -251,6 +253,6 @@ func CaptureTraceStatusAndError(span otelTrace.Span, err error) {
 	span.RecordError(err)
 }
 
-func CaptureMetrics(serviceName string) otelMetric.Meter {
+func CaptureMetrics(serviceName string) otelMetric.Meter { //nolint: ireturn
 	return otel.Meter(serviceName)
 }
