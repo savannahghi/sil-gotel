@@ -1,0 +1,21 @@
+run:
+  tests: false
+linters:
+  disable:
+    - canonicalheader
+    - depguard
+    - dupl
+    - err113
+    - exhaustruct
+    - mnd
+    - tagliatelle
+    - unparam
+    - unused
+    - varnamelen
+    - wrapcheck
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

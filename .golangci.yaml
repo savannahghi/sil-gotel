@@ -1,0 +1,36 @@
+version: "2"
+run:
+  tests: false
+linters:
+  disable:
+    - canonicalheader
+    - depguard
+    - dupl
+    - err113
+    - exhaustruct
+    - mnd
+    - tagliatelle
+    - unparam
+    - unused
+    - embeddedstructfieldcheck
+    - noinlineerr
+    - varnamelen
+    - wrapcheck
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
