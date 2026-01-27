@@ -63,6 +63,21 @@ otelClient := &silotel.Client{
 
 ### 3. **You're All Set!**
 
+
+### 4. **How to use!***
+```
+ctx, span := silgotel.Trace(ctx, "mypackage", "myOperation")
+defer span.End()
+
+// ... rest of your code ...
+result, err := someOperation()
+if err != nil {
+    silgotel.Logger(ctx, name, err.Error())
+	silgotel.CaptureTraceStatusAndError(span, err)
+    return err
+}
+
+```
 Once initialized, the SDK handles telemetry setup and instrumentation automatically.
 
 ---

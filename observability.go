@@ -234,11 +234,11 @@ func (c *Client) newLoggerProvider(ctx context.Context) (*log.LoggerProvider, er
 	return provider, nil
 }
 
-func Trace(ctx context.Context, packageName, spanName string) (context.Context, otelTrace.Span) { //nolint: ireturn
+//nolint:ireturn,spancheck
+func Trace(ctx context.Context, packageName, spanName string) (context.Context, otelTrace.Span) {
 	tracer := otel.Tracer(packageName)
 
 	ctx, span := tracer.Start(ctx, spanName)
-	defer span.End()
 
 	return ctx, span
 }
