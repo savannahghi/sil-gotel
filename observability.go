@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
@@ -24,17 +25,9 @@ import (
 	otelTrace "go.opentelemetry.io/otel/trace"
 )
 
-// setupOtelSDK bootstraps the OpenTelemetry pipeline.
-// If it does not return an error, make sure to call shutdown for proper cleanup.
 func (c *Client) setupOtelSDK(ctx context.Context) (func(context.Context) error, error) {
-	var (
-		shutdownFuncs []func(context.Context) error
-		err           error
-	)
+	var shutdownFuncs []func(context.Context) error
 
-	// shutdown calls cleanup functions registered via shutdownFuncs.
-	// The errors from the calls are joined.
-	// Each registered cleanup will be invoked once.
 	shutdown := func(ctx context.Context) error {
 		var err error
 		for _, fn := range shutdownFuncs {
@@ -46,55 +39,53 @@ func (c *Client) setupOtelSDK(ctx context.Context) (func(context.Context) error,
 		return err
 	}
 
-	// handleErr calls shutdown for cleanup and makes sure that all errors are returned.
-	handleErr := func(inErr error) {
-		err = errors.Join(inErr, shutdown(ctx))
+	res, err := c.newResource(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("creating resource: %w", err)
 	}
 
-	// Set up propagator.
-	prop := newPropagator()
-	otel.SetTextMapPropagator(prop)
+	otel.SetTextMapPropagator(newPropagator())
 
-	// Set up trace provider.
-	tracerProvider, err := c.newTracerProvider(ctx)
+	tracerProvider, err := c.newTracerProvider(ctx, res)
 	if err != nil {
-		handleErr(err)
-
-		return shutdown, err
+		return nil, errors.Join(err, shutdown(ctx))
 	}
 
 	shutdownFuncs = append(shutdownFuncs, tracerProvider.Shutdown)
 	otel.SetTracerProvider(tracerProvider)
 
-	meterProvider, err := c.newMeterProvider(ctx)
+	meterProvider, err := c.newMeterProvider(ctx, res)
 	if err != nil {
-		handleErr(err)
-
-		return shutdown, err
+		return nil, errors.Join(err, shutdown(ctx))
 	}
 
 	shutdownFuncs = append(shutdownFuncs, meterProvider.Shutdown)
 	otel.SetMeterProvider(meterProvider)
 
-	// Set up logger provider.
-	loggerProvider, err := c.newLoggerProvider(ctx)
+	loggerProvider, err := c.newLoggerProvider(ctx, res)
 	if err != nil {
-		handleErr(err)
-
-		return shutdown, err
+		return nil, errors.Join(err, shutdown(ctx))
 	}
 
 	shutdownFuncs = append(shutdownFuncs, loggerProvider.Shutdown)
-	// Register as global logger provider so that it can be accessed global.LoggerProvider.
-	// Most log bridges use the global logger provider as default.
-	// If the global logger provider is not set then a no-op implementation
-	// is used, which fails to generate data.
 	global.SetLoggerProvider(loggerProvider)
 
-	return shutdown, err
+	return shutdown, nil
 }
 
-//nolint:ireturn
+func (c *Client) newResource(_ context.Context) (*resource.Resource, error) {
+	return resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String(c.ServiceName),
+			semconv.ServiceVersion(c.Version),
+			semconv.DeploymentEnvironmentName(c.Environment),
+		),
+	)
+}
+
+// nolint: ireturn
 func newPropagator() propagation.TextMapPropagator {
 	return propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
@@ -102,87 +93,49 @@ func newPropagator() propagation.TextMapPropagator {
 	)
 }
 
-func (c *Client) newTracerProvider(ctx context.Context) (*trace.TracerProvider, error) {
-	headers := map[string]string{
-		"content-type": "application/json",
-	}
-
+func (c *Client) newTracerProvider(ctx context.Context, res *resource.Resource) (*trace.TracerProvider, error) {
 	exporter, err := otlptrace.New(
 		ctx,
 		otlptracehttp.NewClient(
 			otlptracehttp.WithEndpointURL(fmt.Sprintf("%s/v1/traces", c.OTLPBaseURL)),
-			otlptracehttp.WithHeaders(headers),
 		),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("creating new exporter: %w", err)
+		return nil, fmt.Errorf("creating trace exporter: %w", err)
 	}
 
-	res := resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceNameKey.String(c.ServiceName),
-		semconv.ServiceVersion(c.Version),
-		semconv.DeploymentEnvironmentName(c.Environment),
-	)
-
-	tracerProvider := trace.NewTracerProvider(
-		trace.WithBatcher(
-			exporter,
+	return trace.NewTracerProvider(
+		trace.WithBatcher(exporter,
 			trace.WithMaxExportBatchSize(trace.DefaultMaxExportBatchSize),
 			trace.WithBatchTimeout(trace.DefaultScheduleDelay),
 			trace.WithExportTimeout(10*time.Second),
 		),
 		trace.WithResource(res),
-	)
-
-	otel.SetTracerProvider(tracerProvider)
-	_ = tracerProvider.Tracer(c.ServiceName)
-
-	return tracerProvider, nil
+	), nil
 }
 
-func (c *Client) newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
-	headers := map[string]string{
-		"content-type": "application/json",
-	}
-
-	metricExporter, err := otlpmetrichttp.New(
+func (c *Client) newMeterProvider(ctx context.Context, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
+	exporter, err := otlpmetrichttp.New(
 		ctx,
 		otlpmetrichttp.WithEndpointURL(fmt.Sprintf("%s/v1/metrics", c.OTLPBaseURL)),
-		otlpmetrichttp.WithHeaders(headers),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("creating metric exporter: %w", err)
 	}
 
-	res, err := resource.New(
-		ctx,
-		resource.WithAttributes(
-			semconv.ServiceNameKey.String(c.ServiceName),
-			semconv.ServiceVersion(c.Version),
-			semconv.DeploymentEnvironmentName(c.Environment),
-		),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	meterProvider := sdkmetric.NewMeterProvider(
+	return sdkmetric.NewMeterProvider(
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(
-			sdkmetric.NewPeriodicReader(
-				metricExporter,
-				sdkmetric.WithInterval(5*time.Second),
+			sdkmetric.NewPeriodicReader(exporter,
+				sdkmetric.WithInterval(30*time.Second),
 				sdkmetric.WithTimeout(10*time.Second),
 			),
 		),
 		WithHTTPViews(),
-	)
-
-	return meterProvider, nil
+	), nil
 }
 
-//nolint:ireturn
+// nolint: godoclint,ireturn
 func WithHTTPViews() sdkmetric.Option {
 	return sdkmetric.WithView(
 		sdkmetric.NewView(
@@ -200,59 +153,83 @@ func WithHTTPViews() sdkmetric.Option {
 				Unit: "s",
 			},
 		),
+		sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name: "http.server.request.body.size",
+				Kind: sdkmetric.InstrumentKindHistogram,
+			},
+			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+					Boundaries: []float64{
+						256, 512, 1024, 4096, 16384,
+						65536, 262144, 1048576, 4194304,
+					},
+				},
+				Unit: "By",
+			},
+		),
+		sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name: "http.server.response.body.size",
+				Kind: sdkmetric.InstrumentKindHistogram,
+			},
+			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+					Boundaries: []float64{
+						256, 512, 1024, 4096, 16384,
+						65536, 262144, 1048576, 4194304,
+					},
+				},
+				Unit: "By",
+			},
+		),
 	)
 }
 
-func (c *Client) newLoggerProvider(ctx context.Context) (*log.LoggerProvider, error) {
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName(c.ServiceName),
-			semconv.ServiceVersion(c.Version),
-			semconv.DeploymentEnvironmentName(c.Environment),
-		),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to merge resource: %w", err)
-	}
-
+func (c *Client) newLoggerProvider(ctx context.Context, res *resource.Resource) (*log.LoggerProvider, error) {
 	exporter, err := otlploghttp.New(
 		ctx,
 		otlploghttp.WithEndpointURL(fmt.Sprintf("%s/v1/logs", c.OTLPBaseURL)),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("creating log exporter: %w", err)
 	}
 
-	processor := log.NewBatchProcessor(exporter)
-	provider := log.NewLoggerProvider(
+	return log.NewLoggerProvider(
 		log.WithResource(res),
-		log.WithProcessor(processor),
-	)
-
-	return provider, nil
+		log.WithProcessor(log.NewBatchProcessor(exporter)),
+	), nil
 }
 
-//nolint:ireturn,spancheck
-func Trace(ctx context.Context, packageName, spanName string) (context.Context, otelTrace.Span) {
+// Trace starts a new span and returns the updated context.
+//
+// nolint: ireturn
+func Trace(ctx context.Context, packageName, spanName string) (context.Context, otelTrace.Span) { //nolint:ireturn
 	tracer := otel.Tracer(packageName)
+	ctx, span := tracer.Start(ctx, spanName) //nolint:spancheck
 
-	ctx, span := tracer.Start(ctx, spanName)
-
+	//nolint:spancheck
 	return ctx, span
 }
 
-func Logger(ctx context.Context, packageName, message string) {
-	otelLogger := otelslog.NewLogger(packageName)
-	otelLogger.ErrorContext(ctx, message)
+// NewLogger returns a reusable slog.Logger bridged to OTel. Cache the result.
+func NewLogger(packageName string) *slog.Logger {
+	return otelslog.NewLogger(packageName)
 }
 
-func CaptureTraceStatusAndError(span otelTrace.Span, err error) {
+// RecordError sets the span status to error and records the error event.
+func RecordError(span otelTrace.Span, err error) {
+	if err == nil {
+		return
+	}
+
 	span.SetStatus(codes.Error, err.Error())
 	span.RecordError(err)
 }
 
-func CaptureMetrics(serviceName string) otelMetric.Meter { //nolint: ireturn
+// Meter returns a named meter for recording metrics.
+//
+//nolint:ireturn
+func Meter(serviceName string) otelMetric.Meter {
 	return otel.Meter(serviceName)
 }
