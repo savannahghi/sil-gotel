@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -85,7 +87,7 @@ func (c *Client) newResource(_ context.Context) (*resource.Resource, error) {
 	)
 }
 
-// nolint: ireturn
+//nolint:ireturn
 func newPropagator() propagation.TextMapPropagator {
 	return propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
@@ -135,22 +137,22 @@ func (c *Client) newMeterProvider(ctx context.Context, res *resource.Resource) (
 	), nil
 }
 
-// nolint: godoclint,ireturn
+//nolint:godoclint,ireturn
 func WithHTTPViews() sdkmetric.Option {
 	return sdkmetric.WithView(
 		sdkmetric.NewView(
 			sdkmetric.Instrument{
-				Name: "http.server.request.duration",
+				Name: "http.server.request_duration_ms",
 				Kind: sdkmetric.InstrumentKindHistogram,
 			},
 			sdkmetric.Stream{
 				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
 					Boundaries: []float64{
-						0.005, 0.01, 0.025, 0.05, 0.1,
-						0.25, 0.5, 1, 2.5, 5, 10,
+						5, 10, 25, 50, 100,
+						250, 500, 1000, 2500, 5000, 10000,
 					},
 				},
-				Unit: "s",
+				Unit: "ms",
 			},
 		),
 		sdkmetric.NewView(
@@ -203,18 +205,13 @@ func (c *Client) newLoggerProvider(ctx context.Context, res *resource.Resource) 
 
 // Trace starts a new span and returns the updated context.
 //
-// nolint: ireturn
-func Trace(ctx context.Context, packageName, spanName string) (context.Context, otelTrace.Span) { //nolint:ireturn
+//nolint:ireturn
+func Trace(ctx context.Context, packageName, spanName string) (context.Context, otelTrace.Span) {
 	tracer := otel.Tracer(packageName)
 	ctx, span := tracer.Start(ctx, spanName) //nolint:spancheck
 
 	//nolint:spancheck
 	return ctx, span
-}
-
-// NewLogger returns a reusable slog.Logger bridged to OTel. Cache the result.
-func NewLogger(packageName string) *slog.Logger {
-	return otelslog.NewLogger(packageName)
 }
 
 // RecordError sets the span status to error and records the error event.
@@ -227,9 +224,114 @@ func RecordError(span otelTrace.Span, err error) {
 	span.RecordError(err)
 }
 
+// NewLogger returns a reusable slog.Logger bridged to OTel. Cache the result.
+func NewLogger(packageName string) *slog.Logger {
+	return otelslog.NewLogger(packageName)
+}
+
 // Meter returns a named meter for recording metrics.
 //
 //nolint:ireturn
 func Meter(serviceName string) otelMetric.Meter {
 	return otel.Meter(serviceName)
+}
+
+// Gin HTTP middleware configuration
+//
+//nolint:ireturn
+func mustInstrument[T any](v T, err error) T {
+	if err != nil {
+		panic(fmt.Sprintf("silgotel: failed to create metric instrument: %v", err))
+	}
+
+	return v
+}
+
+type httpMetrics struct {
+	requestCounter  otelMetric.Int64Counter
+	requestDuration otelMetric.Float64Histogram
+	activeRequests  otelMetric.Int64UpDownCounter
+	requestSize     otelMetric.Int64Histogram
+	responseSize    otelMetric.Int64Histogram
+}
+
+func newHTTPMetrics(serviceName string) *httpMetrics {
+	meter := Meter(serviceName)
+
+	return &httpMetrics{
+		requestCounter: mustInstrument(meter.Int64Counter(
+			"http.server.requests_total",
+			otelMetric.WithDescription("Total number of HTTP requests processed"),
+		)),
+		requestDuration: mustInstrument(meter.Float64Histogram(
+			"http.server.request_duration_ms",
+			otelMetric.WithDescription("Request duration in milliseconds"),
+			otelMetric.WithUnit("ms"),
+		)),
+		activeRequests: mustInstrument(meter.Int64UpDownCounter(
+			"http.server.active_requests",
+			otelMetric.WithDescription("Number of active HTTP server requests"),
+			otelMetric.WithUnit("1"),
+		)),
+		requestSize: mustInstrument(meter.Int64Histogram(
+			"http.server.request.body.size",
+			otelMetric.WithDescription("Size of HTTP server request bodies"),
+			otelMetric.WithUnit("By"),
+		)),
+		responseSize: mustInstrument(meter.Int64Histogram(
+			"http.server.response.body.size",
+			otelMetric.WithDescription("Size of HTTP server response bodies"),
+			otelMetric.WithUnit("By"),
+		)),
+	}
+}
+
+// RequestMetrics returns a Gin middleware that records HTTP server metrics.
+// The serviceName should match the service name used in NewOtelSDK.
+func RequestMetrics(serviceName string) gin.HandlerFunc {
+	m := newHTTPMetrics(serviceName)
+
+	return func(c *gin.Context) {
+		scheme := c.GetHeader("X-Forwarded-Proto")
+		if scheme == "" {
+			scheme = "http"
+		}
+
+		route := c.FullPath()
+		if route == "" {
+			route = c.Request.URL.Path
+		}
+
+		baseAttrs := otelMetric.WithAttributes(
+			attribute.String("http.method", c.Request.Method),
+			attribute.String("http.route", route),
+			attribute.String("url.scheme", scheme),
+		)
+
+		ctx := c.Request.Context()
+
+		m.activeRequests.Add(ctx, 1, baseAttrs)
+
+		if c.Request.ContentLength > 0 {
+			m.requestSize.Record(ctx, c.Request.ContentLength, baseAttrs)
+		}
+
+		start := time.Now()
+
+		c.Next()
+
+		endAttrs := otelMetric.WithAttributes(
+			attribute.String("http.method", c.Request.Method),
+			attribute.String("http.route", route),
+			attribute.String("url.scheme", scheme),
+			attribute.Int("http.status_code", c.Writer.Status()),
+		)
+
+		durationMs := float64(time.Since(start).Milliseconds())
+
+		m.requestCounter.Add(ctx, 1, endAttrs)
+		m.requestDuration.Record(ctx, durationMs, endAttrs)
+		m.responseSize.Record(ctx, int64(c.Writer.Size()), endAttrs)
+		m.activeRequests.Add(ctx, -1, baseAttrs)
+	}
 }
