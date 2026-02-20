@@ -13,6 +13,7 @@ linters:
     - exhaustruct
     - wrapcheck
     - wsl
+    - nolintlint
   enable:
     - wsl_v5
   settings:
