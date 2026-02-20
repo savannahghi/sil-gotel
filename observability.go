@@ -27,6 +27,11 @@ import (
 	otelTrace "go.opentelemetry.io/otel/trace"
 )
 
+//nolint:gochecknoglobals
+var headers = map[string]string{
+	"content-type": "application/json",
+}
+
 func (c *Client) setupOtelSDK(ctx context.Context) (func(context.Context) error, error) {
 	var shutdownFuncs []func(context.Context) error
 
@@ -100,6 +105,7 @@ func (c *Client) newTracerProvider(ctx context.Context, res *resource.Resource) 
 		ctx,
 		otlptracehttp.NewClient(
 			otlptracehttp.WithEndpointURL(fmt.Sprintf("%s/v1/traces", c.OTLPBaseURL)),
+			otlptracehttp.WithHeaders(headers),
 		),
 	)
 	if err != nil {
@@ -120,6 +126,7 @@ func (c *Client) newMeterProvider(ctx context.Context, res *resource.Resource) (
 	exporter, err := otlpmetrichttp.New(
 		ctx,
 		otlpmetrichttp.WithEndpointURL(fmt.Sprintf("%s/v1/metrics", c.OTLPBaseURL)),
+		otlpmetrichttp.WithHeaders(headers),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating metric exporter: %w", err)
@@ -192,6 +199,7 @@ func (c *Client) newLoggerProvider(ctx context.Context, res *resource.Resource) 
 	exporter, err := otlploghttp.New(
 		ctx,
 		otlploghttp.WithEndpointURL(fmt.Sprintf("%s/v1/logs", c.OTLPBaseURL)),
+		otlploghttp.WithHeaders(headers),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating log exporter: %w", err)
