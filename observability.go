@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -294,52 +295,86 @@ func newHTTPMetrics(serviceName string) *httpMetrics {
 	}
 }
 
-// RequestMetrics returns a Gin middleware that records HTTP server metrics.
+// RequestMetrics returns a standard net/http middleware that records HTTP server metrics.
 // The serviceName should match the service name used in NewOtelSDK.
-func RequestMetrics(serviceName string) gin.HandlerFunc {
+func RequestMetrics(serviceName string) func(http.Handler) http.Handler {
 	m := newHTTPMetrics(serviceName)
 
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			scheme := r.Header.Get("X-Forwarded-Proto")
+			if scheme == "" {
+				scheme = "http"
+			}
+
+			route := r.URL.Path // consumers can enrich this via context if needed
+
+			baseAttrs := otelMetric.WithAttributes(
+				attribute.String("http.method", r.Method),
+				attribute.String("http.route", route),
+				attribute.String("url.scheme", scheme),
+			)
+
+			ctx := r.Context()
+			m.activeRequests.Add(ctx, 1, baseAttrs)
+
+			if r.ContentLength > 0 {
+				m.requestSize.Record(ctx, r.ContentLength, baseAttrs)
+			}
+
+			rw := newResponseWriter(w)
+			start := time.Now()
+
+			next.ServeHTTP(rw, r)
+
+			endAttrs := otelMetric.WithAttributes(
+				attribute.String("http.method", r.Method),
+				attribute.String("http.route", route),
+				attribute.String("url.scheme", scheme),
+				attribute.Int("http.status_code", rw.status),
+			)
+
+			durationMs := float64(time.Since(start).Milliseconds())
+
+			m.requestCounter.Add(ctx, 1, endAttrs)
+			m.requestDuration.Record(ctx, durationMs, endAttrs)
+			m.responseSize.Record(ctx, int64(rw.size), endAttrs)
+			m.activeRequests.Add(ctx, -1, baseAttrs)
+		})
+	}
+}
+
+// responseWriter wraps http.ResponseWriter to capture status code and response size.
+type responseWriter struct {
+	http.ResponseWriter
+
+	status int
+	size   int
+}
+
+func newResponseWriter(w http.ResponseWriter) *responseWriter {
+	return &responseWriter{ResponseWriter: w, status: http.StatusOK}
+}
+
+func (rw *responseWriter) WriteHeader(status int) {
+	rw.status = status
+	rw.ResponseWriter.WriteHeader(status)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	n, err := rw.ResponseWriter.Write(b)
+	rw.size += n
+
+	return n, err
+}
+
+func GinRequestMetrics(serviceName string) gin.HandlerFunc {
+	middleware := RequestMetrics(serviceName)
+
 	return func(c *gin.Context) {
-		scheme := c.GetHeader("X-Forwarded-Proto")
-		if scheme == "" {
-			scheme = "http"
-		}
-
-		route := c.FullPath()
-		if route == "" {
-			route = c.Request.URL.Path
-		}
-
-		baseAttrs := otelMetric.WithAttributes(
-			attribute.String("http.method", c.Request.Method),
-			attribute.String("http.route", route),
-			attribute.String("url.scheme", scheme),
-		)
-
-		ctx := c.Request.Context()
-
-		m.activeRequests.Add(ctx, 1, baseAttrs)
-
-		if c.Request.ContentLength > 0 {
-			m.requestSize.Record(ctx, c.Request.ContentLength, baseAttrs)
-		}
-
-		start := time.Now()
-
-		c.Next()
-
-		endAttrs := otelMetric.WithAttributes(
-			attribute.String("http.method", c.Request.Method),
-			attribute.String("http.route", route),
-			attribute.String("url.scheme", scheme),
-			attribute.Int("http.status_code", c.Writer.Status()),
-		)
-
-		durationMs := float64(time.Since(start).Milliseconds())
-
-		m.requestCounter.Add(ctx, 1, endAttrs)
-		m.requestDuration.Record(ctx, durationMs, endAttrs)
-		m.responseSize.Record(ctx, int64(c.Writer.Size()), endAttrs)
-		m.activeRequests.Add(ctx, -1, baseAttrs)
+		middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c.Request = r
+			c.Next()
+		})).ServeHTTP(c.Writer, c.Request)
 	}
 }
