@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	pyroscope "github.com/grafana/pyroscope-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -557,4 +558,24 @@ func GinRequestMetrics(serviceName string) gin.HandlerFunc {
 			c.Next()
 		})).ServeHTTP(c.Writer, c.Request)
 	}
+}
+
+// StartProfiler starts and returns a pyroscope profiler. Caller must explicitly
+// call profiler.Stop() upon application exit.
+func StartProfiler(endpoint, serviceName, environment string) (*pyroscope.Profiler, error) {
+	profiler, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: serviceName,
+		Logger:          pyroscope.StandardLogger,
+		ServerAddress:   endpoint,
+		Tags:            map[string]string{"environment": environment},
+		ProfileTypes: []pyroscope.ProfileType{
+			pyroscope.ProfileGoroutines,
+			pyroscope.ProfileMutexCount,
+			pyroscope.ProfileMutexDuration,
+			pyroscope.ProfileBlockCount,
+			pyroscope.ProfileBlockDuration,
+		},
+	})
+
+	return profiler, err
 }
