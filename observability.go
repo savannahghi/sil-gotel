@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	pyroscope "github.com/grafana/pyroscope-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
@@ -31,6 +32,10 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	otelTrace "go.opentelemetry.io/otel/trace"
 )
+
+type ctxKey string
+
+var loggerKey ctxKey = "LoggingMiddlewareKey" //nolint: gochecknoglobals
 
 //nolint:gochecknoglobals
 var headers = map[string]string{
@@ -483,12 +488,15 @@ func RequestMetrics(serviceName string) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, span := Trace(r.Context(), serviceName, "RequestMetrics")
+			defer span.End()
+
 			scheme := r.Header.Get("X-Forwarded-Proto")
 			if scheme == "" {
 				scheme = "http"
 			}
 
-			route := r.URL.Path // consumers can enrich this via context if needed
+			route := normalizedRoutePattern(r) // consumers can enrich this via context if needed
 
 			baseAttrs := otelMetric.WithAttributes(
 				attribute.String("http.method", r.Method),
@@ -496,7 +504,6 @@ func RequestMetrics(serviceName string) func(http.Handler) http.Handler {
 				attribute.String("url.scheme", scheme),
 			)
 
-			ctx := r.Context()
 			m.activeRequests.Add(ctx, 1, baseAttrs)
 
 			if r.ContentLength > 0 {
@@ -578,4 +585,48 @@ func StartProfiler(endpoint, serviceName, environment string) (*pyroscope.Profil
 	})
 
 	return profiler, err
+}
+
+// LoggingMiddleware returns a standard net/http middleware for logging.
+//
+//	r.Use(silotel.LoggingMiddleware("example"))
+//
+// Check LoggerFromContext for usage details.
+func LoggingMiddleware(serviceName string) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, span := Trace(r.Context(), serviceName, "LoggingMiddleware")
+			defer span.End()
+
+			logger := slog.With(
+				"request_id", uuid.New().String(),
+				"method", r.Method,
+				"path", normalizedRoutePattern(r),
+			)
+
+			ctx = context.WithValue(ctx, loggerKey, logger)
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// LoggerFromContext returns a *[slog.Logger] from context.
+//
+//	logger := silotel.LoggerFromContext(ctx).With("user", "user123")
+//	logger.Info("usage example")
+func LoggerFromContext(ctx context.Context) *slog.Logger {
+	if logger, ok := ctx.Value(loggerKey).(*slog.Logger); ok {
+		return logger
+	}
+
+	return slog.Default()
+}
+
+func normalizedRoutePattern(r *http.Request) string {
+	if r.Pattern != "" {
+		return r.Pattern
+	}
+
+	return r.URL.Path
 }
