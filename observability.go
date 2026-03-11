@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -150,17 +153,17 @@ func WithHTTPViews() sdkmetric.Option {
 	return sdkmetric.WithView(
 		sdkmetric.NewView(
 			sdkmetric.Instrument{
-				Name: "http.server.request_duration_ms",
+				Name: "http.server.request_duration",
 				Kind: sdkmetric.InstrumentKindHistogram,
 			},
 			sdkmetric.Stream{
 				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
 					Boundaries: []float64{
-						5, 10, 25, 50, 100,
-						250, 500, 1000, 2500, 5000, 10000,
+						0.005, 0.01, 0.025, 0.05, 0.1,
+						0.25, 0.5, 1, 2.5, 5, 10,
 					},
 				},
-				Unit: "ms",
+				Unit: "s",
 			},
 		),
 		sdkmetric.NewView(
@@ -262,20 +265,38 @@ type httpMetrics struct {
 	activeRequests  otelMetric.Int64UpDownCounter
 	requestSize     otelMetric.Int64Histogram
 	responseSize    otelMetric.Int64Histogram
+	cpuUsage        otelMetric.Float64ObservableGauge
+	cpuSecondsTotal otelMetric.Float64ObservableCounter
+	memoryUsage     otelMetric.Int64ObservableGauge
+	heapObjects     otelMetric.Int64ObservableGauge
+	goroutineCount  otelMetric.Int64ObservableGauge
+	gcPauseTime     otelMetric.Float64ObservableGauge
+}
+
+type cpuStats struct {
+	timestamp time.Time
+	userTime  float64
+	sysTime   float64
 }
 
 func newHTTPMetrics(serviceName string) *httpMetrics {
 	meter := Meter(serviceName)
 
-	return &httpMetrics{
+	var (
+		lastCPUStats  cpuStats
+		cpuStatsMutex sync.Mutex
+	)
+
+	metrics := &httpMetrics{
 		requestCounter: mustInstrument(meter.Int64Counter(
 			"http.server.requests_total",
 			otelMetric.WithDescription("Total number of HTTP requests processed"),
+			otelMetric.WithUnit("1"),
 		)),
 		requestDuration: mustInstrument(meter.Float64Histogram(
-			"http.server.request_duration_ms",
-			otelMetric.WithDescription("Request duration in milliseconds"),
-			otelMetric.WithUnit("ms"),
+			"http.server.request_duration",
+			otelMetric.WithDescription("HTTP request duration in seconds"),
+			otelMetric.WithUnit("s"),
 		)),
 		activeRequests: mustInstrument(meter.Int64UpDownCounter(
 			"http.server.active_requests",
@@ -284,15 +305,174 @@ func newHTTPMetrics(serviceName string) *httpMetrics {
 		)),
 		requestSize: mustInstrument(meter.Int64Histogram(
 			"http.server.request.body.size",
-			otelMetric.WithDescription("Size of HTTP server request bodies"),
+			otelMetric.WithDescription("Size of request body in bytes"),
 			otelMetric.WithUnit("By"),
 		)),
 		responseSize: mustInstrument(meter.Int64Histogram(
 			"http.server.response.body.size",
-			otelMetric.WithDescription("Size of HTTP server response bodies"),
+			otelMetric.WithDescription("Size of response body in bytes"),
 			otelMetric.WithUnit("By"),
 		)),
+		cpuUsage: mustInstrument(meter.Float64ObservableGauge(
+			"system.cpu.usage",
+			otelMetric.WithDescription("Percentage of CPU used"),
+			otelMetric.WithUnit("%"),
+			otelMetric.WithFloat64Callback(func(ctx context.Context, fo otelMetric.Float64Observer) error {
+				usage, err := calculateCPUUsage(&lastCPUStats, &cpuStatsMutex)
+				if err != nil {
+					slog.Error("error calculating CPU metrics", "err", err)
+
+					return nil
+				}
+
+				fo.Observe(usage)
+
+				return nil
+			}),
+		)),
+		cpuSecondsTotal: mustInstrument(meter.Float64ObservableCounter(
+			"system.cpu.total_seconds",
+			otelMetric.WithDescription("Total CPU time spend"),
+			otelMetric.WithUnit("s"),
+			otelMetric.WithFloat64Callback(func(ctx context.Context, fo otelMetric.Float64Observer) error {
+				var rusage syscall.Rusage
+
+				err := syscall.Getrusage(syscall.RUSAGE_SELF, &rusage)
+				if err != nil {
+					slog.Error("error calculating CPU metrics", "err", err)
+
+					return nil
+				}
+
+				userSec := float64(rusage.Utime.Sec) + float64(rusage.Utime.Usec)/1e6
+				sysSec := float64(rusage.Stime.Sec) + float64(rusage.Stime.Usec)/1e6
+
+				fo.Observe(userSec, otelMetric.WithAttributes(attribute.String("mode", "user")))
+				fo.Observe(sysSec, otelMetric.WithAttributes(attribute.String("mode", "system")))
+
+				return nil
+			}),
+		)),
+		goroutineCount: mustInstrument(meter.Int64ObservableGauge(
+			"system.cpu.goroutines_count",
+			otelMetric.WithDescription("Number of active goroutines in the system"),
+			otelMetric.WithUnit("1"),
+			otelMetric.WithInt64Callback(func(_ context.Context, io otelMetric.Int64Observer) error {
+				io.Observe(int64(runtime.NumGoroutine()))
+
+				return nil
+			}),
+		)),
 	}
+
+	metrics.memoryUsage = mustInstrument(meter.Int64ObservableGauge(
+		"system.memory.usage",
+		otelMetric.WithDescription("Total system memory used"),
+		otelMetric.WithUnit("By"),
+	))
+	metrics.heapObjects = mustInstrument(meter.Int64ObservableGauge(
+		"system.memory.heap_objects",
+		otelMetric.WithDescription("Number of heap objects in memory"),
+		otelMetric.WithUnit("1"),
+	))
+	metrics.gcPauseTime = mustInstrument(meter.Float64ObservableGauge(
+		"system.memory.gc_pause_time",
+		otelMetric.WithDescription("Most recent GC pause duration"),
+		otelMetric.WithUnit("s"),
+	))
+
+	_, err := meter.RegisterCallback(
+		func(_ context.Context, o otelMetric.Observer) error {
+			var m runtime.MemStats
+
+			runtime.ReadMemStats(&m)
+
+			o.ObserveInt64(metrics.memoryUsage,
+				int64(m.Alloc), // nolint: gosec
+				otelMetric.WithAttributes(attribute.String("type", "alloc")),
+			)
+			o.ObserveInt64(metrics.memoryUsage,
+				int64(m.HeapAlloc), // nolint: gosec
+				otelMetric.WithAttributes(attribute.String("type", "heap_alloc")),
+			)
+			o.ObserveInt64(metrics.memoryUsage,
+				int64(m.HeapInuse), // nolint: gosec
+				otelMetric.WithAttributes(attribute.String("type", "heap_inuse")),
+			)
+			o.ObserveInt64(metrics.memoryUsage,
+				int64(m.HeapIdle), // nolint: gosec
+				otelMetric.WithAttributes(attribute.String("type", "heap_idle")),
+			)
+			o.ObserveInt64(metrics.memoryUsage,
+				int64(m.StackInuse), // nolint: gosec
+				otelMetric.WithAttributes(attribute.String("type", "stack_inuse")),
+			)
+			o.ObserveInt64(metrics.memoryUsage,
+				int64(m.Sys), // nolint: gosec
+				otelMetric.WithAttributes(attribute.String("type", "sys")),
+			)
+
+			o.ObserveInt64(metrics.heapObjects, int64(m.HeapObjects)) // nolint: gosec
+
+			if m.NumGC > 0 {
+				idx := (m.NumGC + 255) % 256
+				o.ObserveFloat64(metrics.gcPauseTime, float64(m.PauseNs[idx])/1e9)
+			}
+
+			return nil
+		},
+		metrics.memoryUsage,
+		metrics.heapObjects,
+		metrics.gcPauseTime,
+	)
+	if err != nil {
+		panic(fmt.Sprintf("silgotel: failed to register memory metrics callback: %v", err))
+	}
+
+	return metrics
+}
+
+func calculateCPUUsage(stats *cpuStats, statsMutex *sync.Mutex) (float64, error) {
+	var rusage syscall.Rusage
+
+	err := syscall.Getrusage(syscall.RUSAGE_SELF, &rusage)
+	if err != nil {
+		return 0, err
+	}
+
+	currentUserTime := float64(rusage.Utime.Sec) + float64(rusage.Utime.Usec)/1e6
+	currentSysTime := float64(rusage.Stime.Sec) + float64(rusage.Stime.Usec)/1e6
+	now := time.Now()
+
+	statsMutex.Lock()
+	defer statsMutex.Unlock()
+
+	if stats.timestamp.IsZero() {
+		stats.timestamp = now
+		stats.sysTime = currentSysTime
+		stats.userTime = currentUserTime
+
+		return 0, nil
+	}
+
+	elapsed := now.Sub(stats.timestamp).Seconds()
+	if elapsed <= 0 {
+		return 0, nil
+	}
+
+	delta := (currentUserTime - stats.userTime) + (currentSysTime - stats.sysTime)
+	usage := (delta / elapsed) * 100
+
+	stats.timestamp = now
+	stats.userTime = currentUserTime
+	stats.sysTime = currentSysTime
+
+	maxCPU := float64(runtime.NumCPU()) * 100
+	if usage > maxCPU {
+		usage = maxCPU
+	}
+
+	return usage, nil
 }
 
 // RequestMetrics returns a standard net/http middleware that records HTTP server metrics.
@@ -334,10 +514,10 @@ func RequestMetrics(serviceName string) func(http.Handler) http.Handler {
 				attribute.Int("http.status_code", rw.status),
 			)
 
-			durationMs := float64(time.Since(start).Milliseconds())
+			durationSec := time.Since(start).Seconds()
 
 			m.requestCounter.Add(ctx, 1, endAttrs)
-			m.requestDuration.Record(ctx, durationMs, endAttrs)
+			m.requestDuration.Record(ctx, durationSec, endAttrs)
 			m.responseSize.Record(ctx, int64(rw.size), endAttrs)
 			m.activeRequests.Add(ctx, -1, baseAttrs)
 		})
