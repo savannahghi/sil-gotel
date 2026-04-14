@@ -488,8 +488,7 @@ func RequestMetrics(serviceName string) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx, span := Trace(r.Context(), serviceName, "RequestMetrics")
-			defer span.End()
+			ctx := r.Context()
 
 			scheme := r.Header.Get("X-Forwarded-Proto")
 			if scheme == "" {
@@ -595,32 +594,29 @@ func StartProfiler(endpoint, serviceName, environment string) (*pyroscope.Profil
 func LoggingMiddleware(serviceName string) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx, span := Trace(r.Context(), serviceName, "LoggingMiddleware")
-			defer span.End()
-
 			logger := slog.With(
 				"request_id", uuid.New().String(),
 				"method", r.Method,
 				"path", normalizedRoutePattern(r),
 			)
 
-			ctx = context.WithValue(ctx, loggerKey, logger)
+			ctx := context.WithValue(r.Context(), loggerKey, logger)
 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-// LoggerFromContext returns a *[slog.Logger] from context.
-//
-//	logger := silotel.LoggerFromContext(ctx).With("user", "user123")
-//	logger.Info("usage example")
-func LoggerFromContext(ctx context.Context) *slog.Logger {
-	if logger, ok := ctx.Value(loggerKey).(*slog.Logger); ok {
-		return logger
-	}
+// GinLoggingMiddleware returns a logger middleware compatible with the Gin.
+func GinLoggingMiddleware(serviceName string) gin.HandlerFunc {
+	middleware := LoggingMiddleware(serviceName)
 
-	return slog.Default()
+	return func(c *gin.Context) {
+		middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c.Request = r
+			c.Next()
+		})).ServeHTTP(c.Writer, c.Request)
+	}
 }
 
 func normalizedRoutePattern(r *http.Request) string {
