@@ -11,6 +11,7 @@ linters:
     - perfsprint
     - mnd
     - exhaustruct
+    - exhaustruct_v5
     - wrapcheck
     - wsl
     - nolintlint

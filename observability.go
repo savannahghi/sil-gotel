@@ -29,7 +29,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 	otelTrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -97,7 +97,7 @@ func (c *Client) newResource(_ context.Context) (*resource.Resource, error) {
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String(c.ServiceName),
 			semconv.ServiceVersion(c.Version),
-			semconv.DeploymentEnvironmentName(c.Environment),
+			semconv.DeploymentEnvironmentNameKey.String(c.Environment),
 		),
 	)
 }
